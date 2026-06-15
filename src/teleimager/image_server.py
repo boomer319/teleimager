@@ -1157,9 +1157,12 @@ class IsaacSimCamera(BaseCamera):
         frame_data = None
         if self._binocular:
             # For binocular cameras: concatenate left + right images
-            left_img = self.multi_image_reader.read_single_image('left')
-            right_img = self.multi_image_reader.read_single_image('right')
-            logger_mp.debug(f"[IsaacSimCamera] {self._cam_topic} - left: {left_img is not None}, right: {right_img is not None}")
+            # Check if this is a head camera (uses "head_left"/"head_right" keys) or wrist ("left"/"right")
+            left_key = "head_left" if self._image_source == "head" else "left"
+            right_key = "head_right" if self._image_source == "head" else "right"
+            left_img = self.multi_image_reader.read_single_image(left_key)
+            right_img = self.multi_image_reader.read_single_image(right_key)
+            logger_mp.debug(f"[IsaacSimCamera] {self._cam_topic} - left ({left_key}): {left_img is not None}, right ({right_key}): {right_img is not None}")
 
             if left_img is not None and right_img is not None:
                 frame_data = cv2.hconcat([left_img, right_img])
@@ -1308,10 +1311,21 @@ class ImageServer:
                         # Binocular cameras (like head) need to read left+right and concatenate
                         image_source = "head"  # Special marker for binocular
                     else:
-                        # Monocular cameras read their specific source
-                        if "left" in cam_topic.lower():
+                        # Monocular cameras read their specific source.
+                        # The camera_state.py writer produces "head_left", "head_right", "left" (wrist), "right" (wrist)
+                        # so we must match those keys exactly.
+                        topic_lower = cam_topic.lower()
+                        if "head" in topic_lower and "left" in topic_lower:
+                            image_source = "head_left"
+                        elif "head" in topic_lower and "right" in topic_lower:
+                            image_source = "head_right"
+                        elif "wrist" in topic_lower and "left" in topic_lower:
                             image_source = "left"
-                        elif "right" in cam_topic.lower():
+                        elif "wrist" in topic_lower and "right" in topic_lower:
+                            image_source = "right"
+                        elif "left" in topic_lower:
+                            image_source = "left"
+                        elif "right" in topic_lower:
                             image_source = "right"
                         else:
                             image_source = "head"  # fallback
