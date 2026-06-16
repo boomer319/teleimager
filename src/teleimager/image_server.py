@@ -22,6 +22,7 @@ import time
 import threading
 import signal
 import functools
+import re
 import subprocess
 import platform
 from .image_client import TripleRingBuffer, ZMQ_PublisherManager, ZMQ_Responser
@@ -70,6 +71,25 @@ CERT_PEM_PATH = CERT_PEM_PATH.resolve()
 KEY_PEM_PATH = KEY_PEM_PATH.resolve()
 
 # ========================================================
+# WebRTC global encoder config (bitrate caps + GOP).
+# aiortc's bitrate constants are module-level, so this is global by design.
+# ========================================================
+_GOP_LENGTH = 60  # frames between keyframes; overridden by yaml if present
+
+def _apply_webrtc_config(cam_config):
+    global _GOP_LENGTH
+    cfg = (cam_config or {}).get("webrtc", {})
+    bitrate = cfg.get("bitrate", {})
+    from aiortc.codecs import vpx
+    for key, attr in (("min", "MIN_BITRATE"), ("default", "DEFAULT_BITRATE"), ("max", "MAX_BITRATE")):
+        if key in bitrate and int(bitrate[key]) >= 100_000:
+            setattr(h264, attr, int(bitrate[key]))
+            setattr(vpx, attr, int(bitrate[key]))
+    if "gop_length" in cfg and int(cfg["gop_length"]) > 0:
+        _GOP_LENGTH = int(cfg["gop_length"])
+    logger_mp.info(f"[WebRTC] bitrate min/default/max={h264.MIN_BITRATE}/{h264.DEFAULT_BITRATE}/{h264.MAX_BITRATE}, gop={_GOP_LENGTH}")
+
+# ========================================================
 # libx264 for Jetson (Patch h264 Encoder)
 # ========================================================
 def jetson_software_encode_frame(self, frame: av.VideoFrame, force_keyframe: bool):
@@ -90,7 +110,7 @@ def jetson_software_encode_frame(self, frame: av.VideoFrame, force_keyframe: boo
                 "preset": "ultrafast",
                 "tune": "zerolatency",
                 "threads": "1",
-                "g": "60",
+                "g": str(_GOP_LENGTH),
             }
             self.frame_count = 0
             force_keyframe = True
@@ -98,7 +118,7 @@ def jetson_software_encode_frame(self, frame: av.VideoFrame, force_keyframe: boo
             logger_mp.error(f"[H264 Patch] Initialization failed: {e}")
             return
 
-    if not force_keyframe and hasattr(self, "frame_count") and self.frame_count % 60 == 0:
+    if not force_keyframe and hasattr(self, "frame_count") and self.frame_count % _GOP_LENGTH == 0:
         force_keyframe = True
     
     self.frame_count = self.frame_count + 1 if hasattr(self, "frame_count") else 1
@@ -172,8 +192,9 @@ INDEX_HTML = """
 
 CLIENT_JS = """
 var pc = null;
+var _fallback = false;
 
-function negotiate() {
+function negotiate(codec) {
     pc.addTransceiver('video', { direction: 'recvonly' });
     return pc.createOffer().then((offer) => {
         return pc.setLocalDescription(offer);
@@ -197,6 +218,7 @@ function negotiate() {
             body: JSON.stringify({
                 sdp: offer.sdp,
                 type: offer.type,
+                codec: codec || null
             }),
             headers: {
                 'Content-Type': 'application/json'
@@ -223,14 +245,26 @@ function start() {
 
     pc.addEventListener('track', (evt) => {
         if (evt.track.kind == 'video') {
-            document.getElementById('video').srcObject = evt.streams[0];
+            var v = document.getElementById('video');
+            v.srcObject = evt.streams[0];
+            // H.264 -> VP8 fallback: if no frames in 5s, reconnect with VP8
+            if (!_fallback) {
+                var t0 = v.currentTime;
+                setTimeout(function() {
+                    if (v.currentTime === t0 && !_fallback) {
+                        stop();
+                        _fallback = true;
+                        start();
+                    }
+                }, 5000);
+            }
         } else {
             document.getElementById('audio').srcObject = evt.streams[0];
         }
     });
 
     document.getElementById('start').style.display = 'none';
-    negotiate();
+    negotiate(_fallback ? 'vp8' : null);
     document.getElementById('stop').style.display = 'inline-block';
 }
 
@@ -241,6 +275,7 @@ function stop() {
         pc.close();
         pc = null;
     }
+    _fallback = false;
 }
 """
 
@@ -352,7 +387,14 @@ class WebRTC_PublisherThread(threading.Thread):
 
     async def _offer(self, request: web.Request) -> web.Response:
         params = await request.json()
-        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+        user_agent = request.headers.get("User-Agent", "").lower()
+        is_firefox = "firefox" in user_agent and "chrome" not in user_agent
+
+        offer_sdp = params["sdp"]
+        if is_firefox and ".local" in offer_sdp:
+            # Keep ICE open when aioice cannot resolve Firefox mDNS candidates.
+            offer_sdp = re.sub(r"a=end-of-candidates\s*\r?\n", "", offer_sdp)
+        offer = RTCSessionDescription(sdp=offer_sdp, type=params["type"])
 
         pc = RTCPeerConnection()
         self._pcs.add(pc)
@@ -364,7 +406,8 @@ class WebRTC_PublisherThread(threading.Thread):
                 relayed_track = self._relay.subscribe(self._bgr_track)
                 transceiver = pc.addTransceiver(relayed_track, direction="sendonly")
                 capabilities = RTCRtpSender.getCapabilities("video")
-                pref = (self._codec_pref or "h264").lower()
+                client_codec = params.get("codec")
+                pref = (client_codec or self._codec_pref or "h264").lower()
 
                 if pref == "h264":
                     h264_codecs = [c for c in capabilities.codecs if c.mimeType == "video/H264"]
@@ -1072,6 +1115,8 @@ class OpenCVCamera(BaseCamera):
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._img_shape[0])
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self._img_shape[1])
         self.cap.set(cv2.CAP_PROP_FPS, self._fps)
+        if not self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1):
+            logger_mp.info(f"[OpenCVCamera: {cam_topic}] CAP_PROP_BUFFERSIZE=1 not supported by backend, kernel buffer left at default")
 
         # Test if the camera can read frames
         if not self._can_read_frame():
@@ -1204,6 +1249,7 @@ class IsaacSimCamera(BaseCamera):
 # ========================================================
 class ImageServer:
     def __init__(self, cam_config, realsense_enable=False, camera_finder_verbose=False, isaacsim_enable=False):
+        _apply_webrtc_config(cam_config)
         self._cam_config = cam_config
         self._realsense_enable = realsense_enable
         self._isaacsim_enable = isaacsim_enable
