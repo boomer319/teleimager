@@ -42,7 +42,7 @@ import fractions
 from typing import Dict, Optional, Tuple, Any
 import logging_mp
 logging_mp.basic_config(level=logging_mp.INFO)
-logger_mp = logging_mp.getLogger(__name__)
+logger_mp = logging_mp.get_logger(__name__)
 
 # ========================================================
 # cam_config_server.yaml path
