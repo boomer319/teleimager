@@ -1257,7 +1257,8 @@ class ImageServer:
         self._cameras: dict[str, BaseCamera] = {}
         if not self._isaacsim_enable:
             self._cam_finder = CameraFinder(realsense_enable, camera_finder_verbose)
-        self._responser = ZMQ_Responser(self._cam_config)
+        _responder_port = int(os.environ.get("IMAGE_SERVER_PORT", "60000"))
+        self._responser = ZMQ_Responser(self._cam_config, port=_responder_port)
         self._zmq_publisher_manager = ZMQ_PublisherManager.get_instance()
         self._webrtc_publisher_manager = WebRTC_PublisherManager.get_instance()
         self._publisher_threads = []  # keep references for graceful join
